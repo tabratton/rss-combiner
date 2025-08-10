@@ -15,7 +15,7 @@ RUN cargo build --release
 
 FROM debian:bookworm-slim AS runtime
 WORKDIR /app
-COPY --from=builder /work/target/release/picklemoney-db-rs /usr/local/bin
+COPY --from=builder /work/target/release/rss-combiner /usr/local/bin
 RUN apt-get update && apt-get install -y openssl ca-certificates
 EXPOSE 8080
-ENTRYPOINT ["/usr/local/bin/picklemoney-db-rs"]
+ENTRYPOINT ["/usr/local/bin/rss-combiner"]
