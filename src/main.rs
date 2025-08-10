@@ -5,16 +5,39 @@ use axum::response::IntoResponse;
 use axum::routing::get;
 use bb8::Pool;
 use bb8_postgres::PostgresConnectionManager;
-use rss::{Channel, ChannelBuilder};
+use rss::{Channel, ChannelBuilder, Item};
 use std::str::FromStr;
 use tokio_postgres::{Config, NoTls, Row};
 use tower::ServiceBuilder;
 use tower_http::cors::CorsLayer;
+use tracing::{info, instrument};
+use tracing_subscriber::fmt::format::FmtSpan;
+use tracing_subscriber::fmt::time::UtcTime;
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::util::SubscriberInitExt;
+use tracing_subscriber::{EnvFilter, Registry, fmt};
 
-// TODO: Add tracing/logging
+fn setup_logging() {
+    Registry::default()
+        .with(EnvFilter::from_default_env())
+        .with(
+            fmt::layer()
+                .event_format(fmt::format().with_timer(UtcTime::rfc_3339()))
+                .with_target(true)
+                .with_file(true)
+                .with_line_number(true)
+                .with_span_events(FmtSpan::CLOSE)
+                .with_level(true)
+                .with_thread_ids(true)
+                .with_thread_names(true),
+        )
+        .init();
+}
 
 #[tokio::main]
 async fn main() -> Result<(), anyhow::Error> {
+    setup_logging();
+
     let postgres_url = std::env::var("DATABASE_URL")?;
     let postgres_config = Config::from_str(postgres_url.as_ref())?;
     let manager = PostgresConnectionManager::new(postgres_config, NoTls);
@@ -36,8 +59,10 @@ async fn main() -> Result<(), anyhow::Error> {
         std::env::var("PORT").unwrap_or("8080".to_string())
     );
 
+    info!("binding to {}", &addr);
     let listener = tokio::net::TcpListener::bind(addr).await?;
 
+    info!("starting server");
     axum::serve(listener, app).await?;
 
     Ok(())
@@ -54,19 +79,38 @@ impl FromRef<AppState> for Pool<PostgresConnectionManager<NoTls>> {
     }
 }
 
+#[instrument(skip(db_pool))]
 async fn get_rss_feed(
     State(db_pool): State<Pool<PostgresConnectionManager<NoTls>>>,
 ) -> Result<impl IntoResponse, AppError> {
-    let conn = db_pool.get().await?;
+    let feeds = get_db_feeds(db_pool).await?;
+    let feed_items = get_feeds_by_url(feeds).await?;
 
-    let prepared = conn.prepare("SELECT url FROM rss.feeds ORDER BY id ASC").await?;
-    let feeds: Vec<Feed> = conn
+    Ok((
+        [(header::CONTENT_TYPE, "text/xml")],
+        get_return_string(feed_items),
+    ))
+}
+
+#[instrument(skip(db_pool))]
+async fn get_db_feeds(
+    db_pool: Pool<PostgresConnectionManager<NoTls>>,
+) -> Result<Vec<Feed>, AppError> {
+    let conn = db_pool.get().await?;
+    let prepared = conn
+        .prepare("SELECT url FROM rss.feeds ORDER BY id ASC")
+        .await?;
+
+    Ok(conn
         .query(&prepared, &[])
         .await?
         .iter()
         .map(|row| row.into())
-        .collect();
+        .collect())
+}
 
+#[instrument(skip(feeds))]
+async fn get_feeds_by_url(feeds: Vec<Feed>) -> Result<Vec<Item>, AppError> {
     let mut feed_items = Vec::new();
     for feed in feeds {
         let content = reqwest::get(feed.url).await?.bytes().await?;
@@ -76,6 +120,11 @@ async fn get_rss_feed(
         }
     }
 
+    Ok(feed_items)
+}
+
+#[instrument(skip(feed_items))]
+fn get_return_string(feed_items: Vec<Item>) -> String {
     let return_feed = ChannelBuilder::default()
         .title("RSS Feed Recombinator")
         .link("http://example.com/feed")
@@ -83,10 +132,7 @@ async fn get_rss_feed(
         .items(feed_items)
         .build();
 
-    Ok((
-        [(header::CONTENT_TYPE, "text/xml")],
-        return_feed.to_string(),
-    ))
+    return_feed.to_string()
 }
 
 struct Feed {
