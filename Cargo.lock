@@ -1371,7 +1371,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "rss-feeds"
+name = "rss-combiner"
 version = "0.1.0"
 dependencies = [
  "anyhow",
