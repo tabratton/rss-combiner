@@ -124,7 +124,7 @@ async fn get_db_feeds(
         .collect())
 }
 
-#[instrument(skip(feeds))]
+#[instrument(skip(feeds,rss_cache))]
 async fn get_feeds_by_url(feeds: Vec<Feed>, rss_cache: Cache<String, Arc<Channel>>) -> Result<Vec<Item>, AppError> {
     let mut feed_items = Vec::new();
     let mut join_set = JoinSet::new();
@@ -144,11 +144,15 @@ async fn get_feeds_by_url(feeds: Vec<Feed>, rss_cache: Cache<String, Arc<Channel
     Ok(feed_items)
 }
 
-#[instrument]
+#[instrument(skip(rss_cache))]
 async fn get_feed_by_url(url: String, rss_cache: Cache<String, Arc<Channel>>) -> Result<Arc<Channel>, AppError> {
     let channel = match rss_cache.get(&url).await {
-        Some(channel) => channel,
+        Some(channel) => {
+            info!("found channel in cache");
+            channel
+        },
         None => {
+            info!("channel not found in cache");
             let content = reqwest::get(&url).await?.bytes().await?;
             let channel: Arc<Channel> = Arc::new(Channel::read_from(&content[..])?);
             rss_cache.insert(url, channel.clone()).await;
