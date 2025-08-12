@@ -77,8 +77,12 @@ async fn run_server() -> Result<(), anyhow::Error> {
     let manager = PostgresConnectionManager::new(postgres_config, NoTls);
     let db_pool = Pool::builder().max_size(10).build(manager).await?;
 
+    let cache_ttl: u64 = match std::env::var("CACHE_TTL_MINS") {
+        Ok(v) => v.parse()?,
+        Err(_) => 35,
+    };
     let rss_cache = CacheBuilder::new(100)
-        .time_to_live(Duration::from_mins(25))
+        .time_to_live(Duration::from_mins(cache_ttl))
         .build();
 
     let app_state = AppState { db_pool, rss_cache };
