@@ -93,7 +93,7 @@ async fn run_server() -> Result<(), anyhow::Error> {
         .layer(CorsLayer::permissive());
 
     let app: Router<()> = Router::new()
-        .route("/rss", get(genereate_feed))
+        .route("/rss", get(generate_feed))
         .with_state(app_state)
         .layer(layer);
 
@@ -124,7 +124,7 @@ impl FromRef<AppState> for Pool<PostgresConnectionManager<NoTls>> {
 }
 
 #[instrument(skip(app_state))]
-async fn genereate_feed(State(app_state): State<AppState>) -> Result<impl IntoResponse, AppError> {
+async fn generate_feed(State(app_state): State<AppState>) -> Result<impl IntoResponse, AppError> {
     let db_pool = app_state.db_pool.clone();
     let rss_cache = app_state.rss_cache.clone();
 
@@ -189,10 +189,21 @@ async fn get_feed_by_url(url: String, rss_cache: Cache<String, Channel>) -> Opti
         None => {
             info!("channel not found in cache");
             let content = match reqwest::get(&url).await {
-                Ok(response) => match response.bytes().await {
-                    Ok(bytes) => bytes,
-                    Err(err) => {
-                        error!(error = %err, "error reading response bytes");
+                Ok(response) => match response.status() {
+                    StatusCode::OK => match response.bytes().await {
+                        Ok(bytes) => bytes,
+                        Err(err) => {
+                            error!(error = %err, "error reading response bytes");
+                            return None;
+                        }
+                    },
+                    _ => {
+                        if let Ok(text) = response.text().await {
+                            error!(url = %url, response = text, "response was not 200 OK");
+                        } else {
+                            error!(url = %url, "response was not 200 OK, error reading response text");
+                        }
+
                         return None;
                     }
                 },
