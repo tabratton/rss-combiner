@@ -1,22 +1,21 @@
-#![feature(duration_constructors_lite)]
-
 use axum::Router;
+use axum::body::Body;
 use axum::extract::{FromRef, State};
-use axum::http::{StatusCode, header};
+use axum::http::{Request, StatusCode, header};
 use axum::response::IntoResponse;
 use axum::routing::get;
 use bb8::Pool;
 use bb8_postgres::PostgresConnectionManager;
-use rss::{Channel, ChannelBuilder, Item};
-use std::str::FromStr;
-use std::sync::Arc;
-use std::time::Duration;
 use moka::future::{Cache, CacheBuilder};
+use rss::{Channel, ChannelBuilder, Item};
+use sentry::integrations::tracing::EventFilter;
+use std::str::FromStr;
+use std::time::Duration;
 use tokio::task::JoinSet;
 use tokio_postgres::{Config, NoTls, Row};
 use tower::ServiceBuilder;
 use tower_http::cors::CorsLayer;
-use tracing::{info, instrument};
+use tracing::{error, info, instrument};
 use tracing_subscriber::fmt::format::FmtSpan;
 use tracing_subscriber::fmt::time::UtcTime;
 use tracing_subscriber::layer::SubscriberExt;
@@ -37,31 +36,64 @@ fn setup_logging() {
                 .with_thread_ids(true)
                 .with_thread_names(true),
         )
+        .with(
+            sentry::integrations::tracing::layer().event_filter(|md| match *md.level() {
+                tracing::Level::ERROR => EventFilter::Event | EventFilter::Log,
+                tracing::Level::TRACE => EventFilter::Ignore,
+                _ => EventFilter::Log,
+            }),
+        )
         .init();
 }
 
-#[tokio::main]
-async fn main() -> Result<(), anyhow::Error> {
+fn main() -> Result<(), anyhow::Error> {
+    let integration = sentry::integrations::contexts::ContextIntegration::new().add_os(false);
+    let _guard = sentry::init((
+        std::env::var("SENTRY_DSN")?,
+        sentry::ClientOptions {
+            release: sentry::release_name!(),
+            // Capture user IPs and potentially sensitive headers when using HTTP server integrations
+            // see https://docs.sentry.io/platforms/rust/data-management/data-collected for more info
+            send_default_pii: true,
+            enable_logs: true,
+            sample_rate: 0.1,
+            traces_sample_rate: 1.0,
+            ..Default::default()
+        }
+        .add_integration(integration),
+    ));
+
     setup_logging();
 
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?
+        .block_on(async { run_server().await })
+}
+
+async fn run_server() -> Result<(), anyhow::Error> {
     let postgres_url = std::env::var("DATABASE_URL")?;
     let postgres_config = Config::from_str(postgres_url.as_ref())?;
     let manager = PostgresConnectionManager::new(postgres_config, NoTls);
-    let pool = Pool::builder().max_size(10).build(manager).await?;
+    let db_pool = Pool::builder().max_size(10).build(manager).await?;
 
     let rss_cache = CacheBuilder::new(100)
         .time_to_live(Duration::from_mins(25))
         .build();
 
-    let app_state = AppState {
-        db_pool: pool,
-        rss_cache: rss_cache,
-    };
+    let app_state = AppState { db_pool, rss_cache };
 
-    let layer = ServiceBuilder::new().layer(CorsLayer::permissive());
+    let layer = ServiceBuilder::new()
+        .layer(sentry::integrations::tower::NewSentryLayer::<Request<Body>>::new_from_top())
+        .layer(
+            sentry::integrations::tower::SentryHttpLayer::new()
+                .enable_transaction()
+                .enable_pii(),
+        )
+        .layer(CorsLayer::permissive());
 
     let app: Router<()> = Router::new()
-        .route("/rss", get(get_rss_feed))
+        .route("/rss", get(genereate_feed))
         .with_state(app_state)
         .layer(layer);
 
@@ -82,7 +114,7 @@ async fn main() -> Result<(), anyhow::Error> {
 #[derive(Clone)]
 struct AppState {
     db_pool: Pool<PostgresConnectionManager<NoTls>>,
-    rss_cache: Cache<String, Arc<Channel>>,
+    rss_cache: Cache<String, Channel>,
 }
 
 impl FromRef<AppState> for Pool<PostgresConnectionManager<NoTls>> {
@@ -92,14 +124,19 @@ impl FromRef<AppState> for Pool<PostgresConnectionManager<NoTls>> {
 }
 
 #[instrument(skip(app_state))]
-async fn get_rss_feed(
-    State(app_state): State<AppState>,
-) -> Result<impl IntoResponse, AppError> {
+async fn genereate_feed(State(app_state): State<AppState>) -> Result<impl IntoResponse, AppError> {
     let db_pool = app_state.db_pool.clone();
     let rss_cache = app_state.rss_cache.clone();
 
-    let feeds = get_db_feeds(db_pool).await?;
-    let feed_items = get_feeds_by_url(feeds, rss_cache).await?;
+    let feeds = match get_db_feeds(db_pool).await {
+        Ok(feeds) => feeds,
+        Err(err) => {
+            error!(error = %err.0, "Error while getting list of feeds from database");
+            return Err(err);
+        }
+    };
+
+    let feed_items = get_feed_items(feeds, rss_cache).await;
 
     Ok((
         [(header::CONTENT_TYPE, "text/xml")],
@@ -124,43 +161,59 @@ async fn get_db_feeds(
         .collect())
 }
 
-#[instrument(skip(feeds,rss_cache))]
-async fn get_feeds_by_url(feeds: Vec<Feed>, rss_cache: Cache<String, Arc<Channel>>) -> Result<Vec<Item>, AppError> {
+#[instrument(skip(feeds, rss_cache))]
+async fn get_feed_items(feeds: Vec<Feed>, rss_cache: Cache<String, Channel>) -> Vec<Item> {
     let mut feed_items = Vec::new();
     let mut join_set = JoinSet::new();
     for feed in feeds {
         let cache = rss_cache.clone();
-        join_set.spawn(async move {
-            get_feed_by_url(feed.url, cache).await
-        });
+        join_set.spawn(async move { get_feed_by_url(feed.url, cache).await });
     }
 
     while let Some(Ok(res)) = join_set.join_next().await {
-        let channel = res?;
-        let items: Vec<Item> = channel.items.iter().map(|item| item.clone()).collect();
-        feed_items.extend(items);
+        if let Some(channel) = res {
+            feed_items.extend(channel.items)
+        }
     }
 
-    Ok(feed_items)
+    feed_items
 }
 
 #[instrument(skip(rss_cache))]
-async fn get_feed_by_url(url: String, rss_cache: Cache<String, Arc<Channel>>) -> Result<Arc<Channel>, AppError> {
+async fn get_feed_by_url(url: String, rss_cache: Cache<String, Channel>) -> Option<Channel> {
     let channel = match rss_cache.get(&url).await {
         Some(channel) => {
             info!("found channel in cache");
             channel
-        },
+        }
         None => {
             info!("channel not found in cache");
-            let content = reqwest::get(&url).await?.bytes().await?;
-            let channel: Arc<Channel> = Arc::new(Channel::read_from(&content[..])?);
+            let content = match reqwest::get(&url).await {
+                Ok(response) => match response.bytes().await {
+                    Ok(bytes) => bytes,
+                    Err(err) => {
+                        error!(error = %err, "error reading response bytes");
+                        return None;
+                    }
+                },
+                Err(err) => {
+                    error!(error = %err, url = %url, "error fetching url");
+                    return None;
+                }
+            };
+            let channel: Channel = match Channel::read_from(&content[..]) {
+                Ok(channel) => channel,
+                Err(err) => {
+                    error!(error = %err, url = %url, "Could not read channel from response");
+                    return None;
+                }
+            };
             rss_cache.insert(url, channel.clone()).await;
             channel
-        },
+        }
     };
 
-    Ok(channel)
+    Some(channel)
 }
 
 #[instrument(skip(feed_items))]

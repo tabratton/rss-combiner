@@ -8,12 +8,13 @@ anyhow = "1.0.98"
 axum = { version = "0.8.0", features = ["default", "http2", "macros"] }
 bb8 = { version = "0.9.0" }
 bb8-postgres = { version = "0.9.0" }
+moka = { version = "0.12.10", features = ["default", "future"] }
 reqwest = "0.12.22"
 rss = "2.0.12"
+sentry = { version = "0.42.0", features = ["anyhow", "default", "logs", "tracing", "tower", "tower-axum-matched-path", "tower-http"] }
 tokio = { version = "1", features = ["rt-multi-thread", "signal"] }
 tokio-postgres = { version = "0.7.13" }
 tower = "0.5.2"
 tower-http = { version = "0.6.6", features = ["cors"] }
 tracing = "0.1.41"
 tracing-subscriber = { version = "0.3.19", features = ["env-filter", "fmt", "time"] }
-moka = {  version = "0.12.10", features = ["default", "future"] }
