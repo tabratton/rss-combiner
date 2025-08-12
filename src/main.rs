@@ -15,7 +15,7 @@ use tokio::task::JoinSet;
 use tokio_postgres::{Config, NoTls, Row};
 use tower::ServiceBuilder;
 use tower_http::cors::CorsLayer;
-use tracing::{error, info, instrument};
+use tracing::{Instrument, error, info, instrument};
 use tracing_subscriber::fmt::format::FmtSpan;
 use tracing_subscriber::fmt::time::UtcTime;
 use tracing_subscriber::layer::SubscriberExt;
@@ -167,7 +167,7 @@ async fn get_feed_items(feeds: Vec<Feed>, rss_cache: Cache<String, Channel>) -> 
     let mut join_set = JoinSet::new();
     for feed in feeds {
         let cache = rss_cache.clone();
-        join_set.spawn(async move { get_feed_by_url(feed.url, cache).await });
+        join_set.spawn(async move { get_feed_by_url(feed.url, cache).await }.in_current_span());
     }
 
     while let Some(Ok(res)) = join_set.join_next().await {
