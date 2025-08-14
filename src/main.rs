@@ -6,6 +6,7 @@ use axum::response::IntoResponse;
 use axum::routing::get;
 use bb8::Pool;
 use bb8_postgres::PostgresConnectionManager;
+use lazy_static::lazy_static;
 use moka::future::{Cache, CacheBuilder};
 use rss::{Channel, ChannelBuilder, Item};
 use sentry::integrations::tracing::EventFilter;
@@ -21,6 +22,13 @@ use tracing_subscriber::fmt::time::UtcTime;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::{EnvFilter, Registry, fmt};
+
+lazy_static! {
+    static ref ITEMS_PER_FEED: usize = std::env::var("ITEMS_PER_FEED")
+        .unwrap_or_default()
+        .parse()
+        .unwrap_or(5);
+}
 
 fn setup_logging() {
     Registry::default()
@@ -176,7 +184,7 @@ async fn get_feed_items(feeds: Vec<Feed>, rss_cache: Cache<String, Channel>) -> 
 
     while let Some(Ok(res)) = join_set.join_next().await {
         if let Some(channel) = res {
-            feed_items.extend(channel.items)
+            feed_items.extend(channel.items.iter().take(*ITEMS_PER_FEED).cloned())
         }
     }
 
