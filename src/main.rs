@@ -193,10 +193,10 @@ async fn get_feed_items(feeds: Vec<Feed>, rss_cache: Cache<String, Channel>) -> 
 
 #[instrument(skip(rss_cache))]
 async fn get_feed_by_url(url: String, rss_cache: Cache<String, Channel>) -> Option<Channel> {
-    let channel = match rss_cache.get(&url).await {
+    match rss_cache.get(&url).await {
         Some(channel) => {
             info!("found channel in cache");
-            channel
+            Some(channel)
         }
         None => {
             info!("channel not found in cache");
@@ -224,19 +224,18 @@ async fn get_feed_by_url(url: String, rss_cache: Cache<String, Channel>) -> Opti
                     return None;
                 }
             };
-            let channel: Channel = match Channel::read_from(&content[..]) {
-                Ok(channel) => channel,
+            match Channel::read_from(&content[..]) {
+                Ok(channel) => {
+                    rss_cache.insert(url, channel.clone()).await;
+                    Some(channel)
+                }
                 Err(err) => {
                     error!(error = %err, url = %url, "Could not read channel from response");
-                    return None;
+                    None
                 }
-            };
-            rss_cache.insert(url, channel.clone()).await;
-            channel
+            }
         }
-    };
-
-    Some(channel)
+    }
 }
 
 #[instrument(skip(feed_items))]
