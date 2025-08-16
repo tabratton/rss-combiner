@@ -2,16 +2,19 @@ use axum::Router;
 use axum::body::Body;
 use axum::extract::{FromRef, State};
 use axum::http::{Request, StatusCode, header};
-use axum::response::IntoResponse;
+use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use bb8::Pool;
 use bb8_postgres::PostgresConnectionManager;
 use lazy_static::lazy_static;
 use moka::future::{Cache, CacheBuilder};
 use rss::{Channel, ChannelBuilder, Item};
+use sentry::integrations::contexts::ContextIntegration;
+use sentry::integrations::tower::{NewSentryLayer, SentryHttpLayer};
 use sentry::integrations::tracing::EventFilter;
 use std::str::FromStr;
 use std::time::Duration;
+use tokio::net::TcpListener;
 use tokio::task::JoinSet;
 use tokio_postgres::{Config, NoTls, Row};
 use tower::ServiceBuilder;
@@ -28,6 +31,11 @@ lazy_static! {
         .unwrap_or_default()
         .parse()
         .unwrap_or(5);
+}
+
+lazy_static! {
+    static ref FEED_LINK_URL: String = std::env::var("FEED_LINK_URL")
+        .unwrap_or("https://example.com/feed".to_string());
 }
 
 fn setup_logging() {
@@ -55,7 +63,7 @@ fn setup_logging() {
 }
 
 fn main() -> Result<(), anyhow::Error> {
-    let integration = sentry::integrations::contexts::ContextIntegration::new().add_os(false);
+    let integration = ContextIntegration::new().add_os(false);
     let _guard = sentry::init((
         std::env::var("SENTRY_DSN")?,
         sentry::ClientOptions {
@@ -96,12 +104,8 @@ async fn run_server() -> Result<(), anyhow::Error> {
     let app_state = AppState { db_pool, rss_cache };
 
     let layer = ServiceBuilder::new()
-        .layer(sentry::integrations::tower::NewSentryLayer::<Request<Body>>::new_from_top())
-        .layer(
-            sentry::integrations::tower::SentryHttpLayer::new()
-                .enable_transaction()
-                .enable_pii(),
-        )
+        .layer(NewSentryLayer::<Request<Body>>::new_from_top())
+        .layer(SentryHttpLayer::new().enable_transaction().enable_pii())
         .layer(CorsLayer::permissive());
 
     let app: Router<()> = Router::new()
@@ -115,7 +119,7 @@ async fn run_server() -> Result<(), anyhow::Error> {
     );
 
     info!("binding to {}", &addr);
-    let listener = tokio::net::TcpListener::bind(addr).await?;
+    let listener = TcpListener::bind(addr).await?;
 
     info!("starting server");
     axum::serve(listener, app).await?;
@@ -242,7 +246,7 @@ async fn get_feed_by_url(url: String, rss_cache: Cache<String, Channel>) -> Opti
 fn get_return_string(feed_items: Vec<Item>) -> String {
     let return_feed = ChannelBuilder::default()
         .title("RSS Feed Recombinator")
-        .link("http://example.com/feed")
+        .link(FEED_LINK_URL.to_string())
         .description("A combination of other feeds")
         .items(feed_items)
         .build();
@@ -250,6 +254,7 @@ fn get_return_string(feed_items: Vec<Item>) -> String {
     return_feed.to_string()
 }
 
+#[derive(Clone)]
 struct Feed {
     // id: i64,
     url: String,
@@ -268,7 +273,7 @@ impl From<&Row> for Feed {
 pub struct AppError(anyhow::Error);
 
 impl IntoResponse for AppError {
-    fn into_response(self) -> axum::response::Response {
+    fn into_response(self) -> Response {
         (StatusCode::INTERNAL_SERVER_ERROR, self.0.to_string()).into_response()
     }
 }
@@ -279,5 +284,92 @@ where
 {
     fn from(err: E) -> Self {
         Self(err.into())
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_get_feed_by_url() {
+        let cache = CacheBuilder::default().build();
+        let mut server = mockito::Server::new_async().await;
+
+        // Use one of these addresses to configure your client
+        let url = server.url();
+
+        // Create a mock
+        let mock = server.mock("GET", "/rss")
+            .with_status(200)
+            .with_header("content-type", "text/xml")
+            .with_body(include_str!("test-feed.xml"))
+            .expect(1)
+            .create();
+
+        let full_url = format!("{url}/rss");
+        let channel = get_feed_by_url(full_url.clone(), cache.clone()).await;
+        assert!(channel.is_some());
+        mock.assert_async().await;
+        assert!(cache.contains_key(&full_url));
+
+        // get same url, should fetch from cache this time
+        let channel = get_feed_by_url(format!("{url}/rss"), cache).await;
+        assert!(channel.is_some());
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_get_feed_by_url_not_ok() {
+        let cache = CacheBuilder::default().build();
+        let mut server = mockito::Server::new_async().await;
+
+        // Use one of these addresses to configure your client
+        let url = server.url();
+
+        // Create a mock
+        let mock = server.mock("GET", "/rss")
+            .with_status(500)
+            .with_header("content-type", "text/xml")
+            .with_body("")
+            .expect(1)
+            .create();
+
+        let full_url = format!("{url}/rss");
+        let channel = get_feed_by_url(full_url.clone(), cache.clone()).await;
+        assert!(channel.is_none());
+        mock.assert_async().await;
+        assert!(!cache.contains_key(&full_url));
+    }
+
+    #[tokio::test]
+    async fn test_get_feed_items() {
+        let cache = CacheBuilder::default().build();
+        let mut server = mockito::Server::new_async().await;
+
+        // Use one of these addresses to configure your client
+        let url = server.url();
+
+        // Create a mock
+        let mock1 = server.mock("GET", "/rss1")
+            .with_status(200)
+            .with_header("content-type", "text/xml")
+            .with_body(include_str!("test-feed.xml"))
+            .expect(1)
+            .create();
+        let mock2 = server.mock("GET", "/rss2")
+            .with_status(200)
+            .with_header("content-type", "text/xml")
+            .with_body(include_str!("test-feed.xml"))
+            .expect(1)
+            .create();
+
+        let feeds = vec![Feed { url: format!("{url}/rss1") }, Feed { url: format!("{url}/rss2") }];
+        let items = get_feed_items(feeds.to_vec(), cache.clone()).await;
+        assert_eq!(2, items.len());
+        mock1.assert_async().await;
+        mock2.assert_async().await;
+        assert!(cache.contains_key(&feeds[0].url));
+        assert!(cache.contains_key(&feeds[1].url));
     }
 }

@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<rss version="2.0">
+    <channel>
+        <title>RSS Feed Recombinator</title>
+        <link>https://example.com/feed</link>
+        <description>test-description</description>
+        <item>
+            <title>test-title</title>
+            <link>https://test.com</link>
+            <description>test-description</description>
+            <guid>test-guid</guid>
+            <pubDate>Sun, 10 Aug 2025 15:24:16 -0000</pubDate>
+        </item>
+    </channel>
+</rss>
