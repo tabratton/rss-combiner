@@ -1,6 +1,8 @@
+#![feature(duration_constructors)]
+
 use axum::Router;
 use axum::body::Body;
-use axum::extract::{FromRef, State};
+use axum::extract::State;
 use axum::http::{Request, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
@@ -12,7 +14,9 @@ use rss::{Channel, ChannelBuilder, Item};
 use sentry::integrations::contexts::ContextIntegration;
 use sentry::integrations::tower::{NewSentryLayer, SentryHttpLayer};
 use sentry::integrations::tracing::EventFilter;
+use std::fmt::Display;
 use std::str::FromStr;
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::TcpListener;
 use tokio::task::JoinSet;
@@ -34,8 +38,8 @@ lazy_static! {
 }
 
 lazy_static! {
-    static ref FEED_LINK_URL: String = std::env::var("FEED_LINK_URL")
-        .unwrap_or("https://example.com/feed".to_string());
+    static ref FEED_LINK_URL: String =
+        std::env::var("FEED_LINK_URL").unwrap_or("https://example.com/feed".to_string());
 }
 
 fn setup_logging() {
@@ -100,8 +104,15 @@ async fn run_server() -> Result<(), anyhow::Error> {
     let rss_cache = CacheBuilder::new(100)
         .time_to_live(Duration::from_mins(cache_ttl))
         .build();
+    let feed_cache = CacheBuilder::new(1)
+        .time_to_live(Duration::from_days(7))
+        .build();
 
-    let app_state = AppState { db_pool, rss_cache };
+    let app_state = AppState {
+        db_pool,
+        rss_cache,
+        feed_cache,
+    };
 
     let layer = ServiceBuilder::new()
         .layer(NewSentryLayer::<Request<Body>>::new_from_top())
@@ -110,6 +121,7 @@ async fn run_server() -> Result<(), anyhow::Error> {
 
     let app: Router<()> = Router::new()
         .route("/rss", get(generate_feed))
+        .route("/flush", get(flush_caches))
         .with_state(app_state)
         .layer(layer);
 
@@ -130,21 +142,17 @@ async fn run_server() -> Result<(), anyhow::Error> {
 #[derive(Clone)]
 struct AppState {
     db_pool: Pool<PostgresConnectionManager<NoTls>>,
-    rss_cache: Cache<String, Channel>,
-}
-
-impl FromRef<AppState> for Pool<PostgresConnectionManager<NoTls>> {
-    fn from_ref(app_state: &AppState) -> Self {
-        app_state.db_pool.clone()
-    }
+    feed_cache: Cache<usize, Arc<Vec<Feed>>>,
+    rss_cache: Cache<Feed, Channel>,
 }
 
 #[instrument(skip(app_state))]
 async fn generate_feed(State(app_state): State<AppState>) -> Result<impl IntoResponse, AppError> {
     let db_pool = app_state.db_pool.clone();
     let rss_cache = app_state.rss_cache.clone();
+    let feed_cache = app_state.feed_cache.clone();
 
-    let feeds = match get_db_feeds(db_pool).await {
+    let feeds = match get_db_feeds(db_pool, feed_cache).await {
         Ok(feeds) => feeds,
         Err(err) => {
             error!(error = %err.0, "Error while getting list of feeds from database");
@@ -160,30 +168,42 @@ async fn generate_feed(State(app_state): State<AppState>) -> Result<impl IntoRes
     ))
 }
 
-#[instrument(skip(db_pool))]
+#[instrument(skip(db_pool, feed_cache))]
 async fn get_db_feeds(
     db_pool: Pool<PostgresConnectionManager<NoTls>>,
-) -> Result<Vec<Feed>, AppError> {
-    let conn = db_pool.get().await?;
-    let prepared = conn
-        .prepare("SELECT url FROM rss.feeds ORDER BY id ASC")
-        .await?;
+    feed_cache: Cache<usize, Arc<Vec<Feed>>>,
+) -> Result<Arc<Vec<Feed>>, AppError> {
+    match feed_cache.get(&0).await {
+        Some(feeds) => Ok(feeds),
+        None => {
+            let conn = db_pool.get().await?;
+            let prepared = conn
+                .prepare("SELECT url FROM rss.feeds ORDER BY id ASC")
+                .await?;
 
-    Ok(conn
-        .query(&prepared, &[])
-        .await?
-        .iter()
-        .map(|row| row.into())
-        .collect())
+            let feeds: Arc<Vec<Feed>> = Arc::new(
+                conn.query(&prepared, &[])
+                    .await?
+                    .iter()
+                    .map(|row| row.into())
+                    .collect(),
+            );
+
+            feed_cache.insert(0, feeds.clone()).await;
+
+            Ok(feeds)
+        }
+    }
 }
 
 #[instrument(skip(feeds, rss_cache))]
-async fn get_feed_items(feeds: Vec<Feed>, rss_cache: Cache<String, Channel>) -> Vec<Item> {
+async fn get_feed_items(feeds: Arc<Vec<Feed>>, rss_cache: Cache<Feed, Channel>) -> Vec<Item> {
     let mut feed_items = Vec::new();
     let mut join_set = JoinSet::new();
-    for feed in feeds {
+    for feed in feeds.iter() {
         let cache = rss_cache.clone();
-        join_set.spawn(async move { get_feed_by_url(feed.url, cache).await }.in_current_span());
+        let url = feed.clone();
+        join_set.spawn(async move { get_feed_by_url(url, cache).await }.in_current_span());
     }
 
     while let Some(Ok(res)) = join_set.join_next().await {
@@ -196,7 +216,7 @@ async fn get_feed_items(feeds: Vec<Feed>, rss_cache: Cache<String, Channel>) -> 
 }
 
 #[instrument(skip(rss_cache))]
-async fn get_feed_by_url(url: String, rss_cache: Cache<String, Channel>) -> Option<Channel> {
+async fn get_feed_by_url(url: Feed, rss_cache: Cache<Feed, Channel>) -> Option<Channel> {
     match rss_cache.get(&url).await {
         Some(channel) => {
             info!("found channel in cache");
@@ -204,7 +224,7 @@ async fn get_feed_by_url(url: String, rss_cache: Cache<String, Channel>) -> Opti
         }
         None => {
             info!("channel not found in cache");
-            let content = match reqwest::get(&url).await {
+            let content = match reqwest::get(&url.0).await {
                 Ok(response) => match response.status() {
                     StatusCode::OK => match response.bytes().await {
                         Ok(bytes) => bytes,
@@ -254,18 +274,36 @@ fn get_return_string(feed_items: Vec<Item>) -> String {
     return_feed.to_string()
 }
 
-#[derive(Clone)]
-struct Feed {
-    // id: i64,
-    url: String,
+#[instrument(skip(app_state))]
+async fn flush_caches(State(app_state): State<AppState>) -> impl IntoResponse {
+    let rss_cache = app_state.rss_cache.clone();
+    let feed_cache = app_state.feed_cache.clone();
+
+    feed_cache.invalidate_all();
+    rss_cache.invalidate_all();
+
+    StatusCode::OK
 }
+
+#[derive(Clone, Eq, PartialEq, Debug, Hash)]
+struct Feed(String);
 
 impl From<&Row> for Feed {
     fn from(row: &Row) -> Self {
-        Self {
-            // id: row.get("id"),
-            url: row.get("url"),
-        }
+        Self(row.get("url"))
+    }
+}
+
+impl From<String> for Feed {
+    fn from(s: String) -> Self {
+        // TODO: add url parsing
+        Self(s)
+    }
+}
+
+impl Display for Feed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
     }
 }
 
@@ -300,21 +338,22 @@ mod test {
         let url = server.url();
 
         // Create a mock
-        let mock = server.mock("GET", "/rss")
+        let mock = server
+            .mock("GET", "/rss")
             .with_status(200)
             .with_header("content-type", "text/xml")
             .with_body(include_str!("test-feed.xml"))
             .expect(1)
             .create();
 
-        let full_url = format!("{url}/rss");
+        let full_url = Feed(format!("{url}/rss"));
         let channel = get_feed_by_url(full_url.clone(), cache.clone()).await;
         assert!(channel.is_some());
         mock.assert_async().await;
         assert!(cache.contains_key(&full_url));
 
         // get same url, should fetch from cache this time
-        let channel = get_feed_by_url(format!("{url}/rss"), cache).await;
+        let channel = get_feed_by_url(Feed(format!("{url}/rss")), cache).await;
         assert!(channel.is_some());
         mock.assert_async().await;
     }
@@ -328,14 +367,15 @@ mod test {
         let url = server.url();
 
         // Create a mock
-        let mock = server.mock("GET", "/rss")
+        let mock = server
+            .mock("GET", "/rss")
             .with_status(500)
             .with_header("content-type", "text/xml")
             .with_body("")
             .expect(1)
             .create();
 
-        let full_url = format!("{url}/rss");
+        let full_url = Feed(format!("{url}/rss"));
         let channel = get_feed_by_url(full_url.clone(), cache.clone()).await;
         assert!(channel.is_none());
         mock.assert_async().await;
@@ -351,25 +391,27 @@ mod test {
         let url = server.url();
 
         // Create a mock
-        let mock1 = server.mock("GET", "/rss1")
+        let mock1 = server
+            .mock("GET", "/rss1")
             .with_status(200)
             .with_header("content-type", "text/xml")
             .with_body(include_str!("test-feed.xml"))
             .expect(1)
             .create();
-        let mock2 = server.mock("GET", "/rss2")
+        let mock2 = server
+            .mock("GET", "/rss2")
             .with_status(200)
             .with_header("content-type", "text/xml")
             .with_body(include_str!("test-feed.xml"))
             .expect(1)
             .create();
 
-        let feeds = vec![Feed { url: format!("{url}/rss1") }, Feed { url: format!("{url}/rss2") }];
-        let items = get_feed_items(feeds.to_vec(), cache.clone()).await;
+        let feeds = vec![Feed(format!("{url}/rss1")), Feed(format!("{url}/rss2"))];
+        let items = get_feed_items(Arc::new(feeds.to_vec()), cache.clone()).await;
         assert_eq!(2, items.len());
         mock1.assert_async().await;
         mock2.assert_async().await;
-        assert!(cache.contains_key(&feeds[0].url));
-        assert!(cache.contains_key(&feeds[1].url));
+        assert!(cache.contains_key(&feeds[0]));
+        assert!(cache.contains_key(&feeds[1]));
     }
 }
