@@ -23,7 +23,7 @@ use tokio::task::JoinSet;
 use tokio_postgres::{Config, NoTls, Row};
 use tower::ServiceBuilder;
 use tower_http::cors::CorsLayer;
-use tracing::{Instrument, error, info, instrument};
+use tracing::{Instrument, error, info, instrument, Span};
 use tracing_subscriber::fmt::format::FmtSpan;
 use tracing_subscriber::fmt::time::UtcTime;
 use tracing_subscriber::layer::SubscriberExt;
@@ -203,7 +203,8 @@ async fn get_feed_items(feeds: Arc<Vec<Feed>>, rss_cache: Cache<Feed, Channel>) 
     for feed in feeds.iter() {
         let cache = rss_cache.clone();
         let url = feed.clone();
-        join_set.spawn(async move { get_feed_by_url(url, cache).await }.in_current_span());
+        let get_feed_closure = async move { get_feed_by_url(url, cache).await };
+        join_set.spawn(get_feed_closure.in_current_span());
     }
 
     while let Some(Ok(res)) = join_set.join_next().await {
@@ -219,11 +220,13 @@ async fn get_feed_items(feeds: Arc<Vec<Feed>>, rss_cache: Cache<Feed, Channel>) 
 async fn get_feed_by_url(url: Feed, rss_cache: Cache<Feed, Channel>) -> Option<Channel> {
     match rss_cache.get(&url).await {
         Some(channel) => {
-            info!("found channel in cache");
+            let current_span = Span::current();
+            current_span.record("cache.result", "hit");
             Some(channel)
         }
         None => {
-            info!("channel not found in cache");
+            let current_span = Span::current();
+            current_span.record("cache.result", "miss");
             let content = match reqwest::get(&url.0).await {
                 Ok(response) => match response.status() {
                     StatusCode::OK => match response.bytes().await {
