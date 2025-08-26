@@ -23,7 +23,7 @@ use tokio::task::JoinSet;
 use tokio_postgres::{Config, NoTls, Row};
 use tower::ServiceBuilder;
 use tower_http::cors::CorsLayer;
-use tracing::{Instrument, error, info, instrument, Span};
+use tracing::{Instrument, Span, error, info, instrument};
 use tracing_subscriber::fmt::format::FmtSpan;
 use tracing_subscriber::fmt::time::UtcTime;
 use tracing_subscriber::layer::SubscriberExt;
@@ -207,10 +207,8 @@ async fn get_feed_items(feeds: Arc<Vec<Feed>>, rss_cache: Cache<Feed, Channel>) 
         join_set.spawn(get_feed_closure.in_current_span());
     }
 
-    while let Some(Ok(res)) = join_set.join_next().await {
-        if let Some(channel) = res {
-            feed_items.extend(channel.items.iter().take(*ITEMS_PER_FEED).cloned())
-        }
+    while let Some(Ok(Some(channel))) = join_set.join_next().await {
+        feed_items.extend(channel.items.iter().take(*ITEMS_PER_FEED).cloned())
     }
 
     feed_items
@@ -227,42 +225,50 @@ async fn get_feed_by_url(url: Feed, rss_cache: Cache<Feed, Channel>) -> Option<C
         None => {
             let current_span = Span::current();
             current_span.record("cache.result", "miss");
-            let content = match reqwest::get(&url.0).await {
-                Ok(response) => match response.status() {
-                    StatusCode::OK => match response.bytes().await {
-                        Ok(bytes) => bytes,
-                        Err(err) => {
-                            error!(error = %err, "error reading response bytes");
-                            return None;
-                        }
-                    },
-                    _ => {
-                        if let Ok(text) = response.text().await {
-                            error!(url = %url, response = text, "response was not 200 OK");
-                        } else {
-                            error!(url = %url, "response was not 200 OK, error reading response text");
-                        }
-
-                        return None;
-                    }
-                },
-                Err(err) => {
-                    error!(error = %err, url = %url, "error fetching url");
-                    return None;
-                }
-            };
-            match Channel::read_from(&content[..]) {
-                Ok(channel) => {
-                    rss_cache.insert(url, channel.clone()).await;
-                    Some(channel)
-                }
-                Err(err) => {
-                    error!(error = %err, url = %url, "Could not read channel from response");
-                    None
-                }
+            if let Some(channel) = make_request(&url).await {
+                rss_cache.insert(url, channel.clone()).await;
+                Some(channel)
+            } else {
+                None
             }
         }
     }
+}
+
+#[instrument]
+async fn make_request(url: &Feed) -> Option<Channel> {
+    let content = match reqwest::get(&url.0).await {
+        Ok(response) => match response.status() {
+            StatusCode::OK => match response.bytes().await {
+                Ok(bytes) => bytes,
+                Err(err) => {
+                    error!(error = %err, "error reading response bytes");
+                    return None;
+                }
+            },
+            _ => {
+                if let Ok(text) = response.text().await {
+                    error!(url = %url, response = text, "response was not 200 OK");
+                } else {
+                    error!(url = %url, "response was not 200 OK, error reading response text");
+                }
+
+                return None;
+            }
+        },
+        Err(err) => {
+            error!(error = %err, url = %url, "error fetching url");
+            return None;
+        }
+    };
+
+    Channel::read_from(&content[..]).map_or_else(
+        |err| {
+            error!(error = %err, url = %url, "Could not read channel from response");
+            None
+        },
+        Some,
+    )
 }
 
 #[instrument(skip(feed_items))]
@@ -337,10 +343,7 @@ mod test {
         let cache = CacheBuilder::default().build();
         let mut server = mockito::Server::new_async().await;
 
-        // Use one of these addresses to configure your client
         let url = server.url();
-
-        // Create a mock
         let mock = server
             .mock("GET", "/rss")
             .with_status(200)
@@ -366,10 +369,7 @@ mod test {
         let cache = CacheBuilder::default().build();
         let mut server = mockito::Server::new_async().await;
 
-        // Use one of these addresses to configure your client
         let url = server.url();
-
-        // Create a mock
         let mock = server
             .mock("GET", "/rss")
             .with_status(500)
@@ -390,10 +390,7 @@ mod test {
         let cache = CacheBuilder::default().build();
         let mut server = mockito::Server::new_async().await;
 
-        // Use one of these addresses to configure your client
         let url = server.url();
-
-        // Create a mock
         let mock1 = server
             .mock("GET", "/rss1")
             .with_status(200)
