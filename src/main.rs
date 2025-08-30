@@ -6,8 +6,6 @@ use axum::extract::State;
 use axum::http::{Request, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
-use bb8::Pool;
-use bb8_postgres::PostgresConnectionManager;
 use bytes::Bytes;
 use lazy_static::lazy_static;
 use moka::future::{Cache, CacheBuilder};
@@ -15,14 +13,14 @@ use rss::{Channel, ChannelBuilder, Item};
 use sentry::integrations::contexts::ContextIntegration;
 use sentry::integrations::tower::{NewSentryLayer, SentryHttpLayer};
 use sentry::integrations::tracing::EventFilter;
+use sqlx::postgres::PgPoolOptions;
+use sqlx::{Pool, Postgres};
 use std::fmt::Display;
 use std::io::BufRead;
-use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::TcpListener;
 use tokio::task::JoinSet;
-use tokio_postgres::{Config, NoTls, Row};
 use tower::ServiceBuilder;
 use tower_http::cors::CorsLayer;
 use tracing::{Instrument, Span, error, info, instrument};
@@ -95,9 +93,10 @@ fn main() -> Result<(), anyhow::Error> {
 
 async fn run_server() -> Result<(), anyhow::Error> {
     let postgres_url = std::env::var("DATABASE_URL")?;
-    let postgres_config = Config::from_str(postgres_url.as_ref())?;
-    let manager = PostgresConnectionManager::new(postgres_config, NoTls);
-    let db_pool = Pool::builder().max_size(10).build(manager).await?;
+    let db_pool = PgPoolOptions::new()
+        .max_connections(10)
+        .connect(postgres_url.as_ref())
+        .await?;
 
     let cache_ttl: u64 = match std::env::var("CACHE_TTL_MINS") {
         Ok(v) => v.parse()?,
@@ -143,7 +142,7 @@ async fn run_server() -> Result<(), anyhow::Error> {
 
 #[derive(Clone)]
 struct AppState {
-    db_pool: Pool<PostgresConnectionManager<NoTls>>,
+    db_pool: Pool<Postgres>,
     feed_cache: Cache<usize, Arc<Vec<Feed>>>,
     rss_cache: Cache<Feed, Channel>,
 }
@@ -172,23 +171,16 @@ async fn generate_feed(State(app_state): State<AppState>) -> Result<impl IntoRes
 
 #[instrument(skip(db_pool, feed_cache))]
 async fn get_db_feeds(
-    db_pool: Pool<PostgresConnectionManager<NoTls>>,
+    db_pool: Pool<Postgres>,
     feed_cache: Cache<usize, Arc<Vec<Feed>>>,
 ) -> Result<Arc<Vec<Feed>>, AppError> {
     match feed_cache.get(&0).await {
         Some(feeds) => Ok(feeds),
         None => {
-            let conn = db_pool.get().await?;
-            let prepared = conn
-                .prepare("SELECT url FROM rss.feeds ORDER BY id ASC")
-                .await?;
-
             let feeds: Arc<Vec<Feed>> = Arc::new(
-                conn.query(&prepared, &[])
-                    .await?
-                    .iter()
-                    .map(|row| row.into())
-                    .collect(),
+                sqlx::query_as!(Feed, "SELECT url FROM rss.feeds ORDER BY id")
+                    .fetch_all(&db_pool)
+                    .await?,
             );
 
             feed_cache.insert(0, feeds.clone()).await;
@@ -239,22 +231,20 @@ async fn get_feed_by_url(url: Feed, rss_cache: Cache<Feed, Channel>) -> Option<C
 
 #[instrument]
 async fn get_external_feed(url: &Feed, rss_cache: Cache<Feed, Channel>) -> Option<Channel> {
-    let content = match make_http_request(url.0.clone()).await {
+    let content = match make_http_request(url.clone().into()).await {
         Ok(content) => content,
         Err(HttpError::TooManyRequests) => {
             tokio::spawn(retry(url.clone(), 3, rss_cache));
             return None;
         }
-        Err(err) => {
-            return None;
-        }
+        Err(_) => return None
     };
 
     channel_from_content(&content[..], url)
 }
 
 async fn retry(url: Feed, retries: usize, rss_cache: Cache<Feed, Channel>) {
-    match make_http_request(url.0.clone()).await {
+    match make_http_request(url.clone().into()).await {
         Ok(content) => {
             if let Some(channel) = channel_from_content(&content[..], &url) {
                 rss_cache.insert(url, channel.clone()).await;
@@ -270,44 +260,42 @@ async fn retry(url: Feed, retries: usize, rss_cache: Cache<Feed, Channel>) {
     }
 }
 
-fn make_http_request(url: String) -> impl Future<Output = Result<Bytes, HttpError>> + Send {
-    async move {
-        match reqwest::get(&url).await {
-            Ok(response) => match response.status() {
-                StatusCode::OK => match response.bytes().await {
-                    Ok(bytes) => Ok(bytes),
-                    Err(err) => {
-                        error!(error = %err, "error reading response bytes");
-                        Err(HttpError::ReadError("error reading response".to_string()))
-                    }
-                },
-                StatusCode::TOO_MANY_REQUESTS => {
-                    error!(url = %url, "too many requests");
-                    Err(HttpError::TooManyRequests)
-                }
-                _ => {
-                    if let Ok(text) = response.text().await {
-                        error!(url = %url, response = text, "response was not 200 OK");
-                    } else {
-                        error!(url = %url, "response was not 200 OK, error reading response text");
-                    }
-
-                    Err(HttpError::NotOk("response was not 200 OK".to_string()))
+async fn make_http_request(url: String) -> Result<Bytes, HttpError> {
+    match reqwest::get(&url).await {
+        Ok(response) => match response.status() {
+            StatusCode::OK => match response.bytes().await {
+                Ok(bytes) => Ok(bytes),
+                Err(err) => {
+                    error!(error = %err, "error reading response bytes");
+                    Err(HttpError::ReadError)
                 }
             },
-            Err(err) => {
-                error!(error = %err, url = %url, "error fetching url");
-                Err(HttpError::ConnectionError("error fetching url".to_string()))
+            StatusCode::TOO_MANY_REQUESTS => {
+                error!(url = %url, "too many requests");
+                Err(HttpError::TooManyRequests)
             }
+            _ => {
+                if let Ok(text) = response.text().await {
+                    error!(url = %url, response = text, "response was not 200 OK");
+                } else {
+                    error!(url = %url, "response was not 200 OK, error reading response text");
+                }
+
+                Err(HttpError::NotOk)
+            }
+        },
+        Err(err) => {
+            error!(error = %err, url = %url, "error fetching url");
+            Err(HttpError::ConnectionError)
         }
     }
 }
 
 enum HttpError {
-    ConnectionError(String),
-    NotOk(String),
+    ConnectionError,
+    NotOk,
     TooManyRequests,
-    ReadError(String),
+    ReadError,
 }
 
 fn channel_from_content(content: impl BufRead, url: &Feed) -> Option<Channel> {
@@ -344,31 +332,33 @@ async fn flush_caches(State(app_state): State<AppState>) -> impl IntoResponse {
 }
 
 #[derive(Clone, Eq, PartialEq, Debug, Hash)]
-struct Feed(String);
-
-impl From<&Row> for Feed {
-    fn from(row: &Row) -> Self {
-        Self(row.get("url"))
-    }
+struct Feed {
+    url: String,
 }
 
 impl From<String> for Feed {
     fn from(s: String) -> Self {
         // TODO: add url parsing
-        Self(s)
+        Self { url: s }
     }
 }
 
 impl From<&String> for Feed {
     fn from(s: &String) -> Self {
         // TODO: add url parsing
-        Self(s.clone())
+        Self { url: s.clone() }
+    }
+}
+
+impl From<Feed> for String {
+    fn from(feed: Feed) -> Self {
+        feed.url
     }
 }
 
 impl Display for Feed {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.0)
+        write!(f, "{}", self.url)
     }
 }
 
@@ -408,14 +398,14 @@ mod test {
             .expect(1)
             .create();
 
-        let full_url = Feed(format!("{url}/rss"));
+        let full_url: Feed = format!("{url}/rss").into();
         let channel = get_feed_by_url(full_url.clone(), cache.clone()).await;
         assert!(channel.is_some());
         mock.assert_async().await;
         assert!(cache.contains_key(&full_url));
 
         // get same url, should fetch from cache this time
-        let channel = get_feed_by_url(Feed(format!("{url}/rss")), cache).await;
+        let channel = get_feed_by_url(format!("{url}/rss").into(), cache).await;
         assert!(channel.is_some());
         mock.assert_async().await;
     }
@@ -434,7 +424,7 @@ mod test {
             .expect(1)
             .create();
 
-        let full_url = Feed(format!("{url}/rss"));
+        let full_url: Feed = format!("{url}/rss").into();
         let channel = get_feed_by_url(full_url.clone(), cache.clone()).await;
         assert!(channel.is_none());
         mock.assert_async().await;
@@ -462,7 +452,7 @@ mod test {
             .expect(1)
             .create();
 
-        let feeds = vec![Feed(format!("{url}/rss1")), Feed(format!("{url}/rss2"))];
+        let feeds = vec![format!("{url}/rss1").into(), format!("{url}/rss2").into()];
         let items = get_feed_items(Arc::new(feeds.to_vec()), cache.clone()).await;
         assert_eq!(2, items.len());
         mock1.assert_async().await;
