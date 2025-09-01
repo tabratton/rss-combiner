@@ -19,4 +19,4 @@ tokio-postgres = { version = "0.7.13" }
 tower = "0.5.2"
 tower-http = { version = "0.6.6", features = ["cors"] }
 tracing = "0.1.41"
-tracing-subscriber = { version = "0.3.19", features = ["env-filter", "fmt", "time"] }
+tracing-subscriber = { version = "0.3.20", features = ["env-filter", "fmt", "time"] }
