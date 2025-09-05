@@ -249,6 +249,8 @@ async fn get_external_feed(url: &Feed, rss_cache: Cache<Feed, Channel>) -> Optio
 }
 
 async fn retry(url: Feed, retries: usize, rss_cache: Cache<Feed, Channel>) {
+    let secs = rand::random_range(30..(15 * 10));
+    tokio::time::sleep(Duration::from_secs(secs)).await;
     match make_http_request(url.clone().into()).await {
         Ok(content) => {
             if let Some(channel) = channel_from_content(&content[..], &url) {
@@ -257,8 +259,6 @@ async fn retry(url: Feed, retries: usize, rss_cache: Cache<Feed, Channel>) {
         }
         Err(_) => {
             if retries > 0 {
-                let secs = rand::random_range(30..(15 * 10));
-                tokio::time::sleep(Duration::from_secs(secs)).await;
                 Box::pin(retry(url, retries - 1, rss_cache)).await;
             }
         }
