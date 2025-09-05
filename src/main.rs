@@ -8,6 +8,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use bb8::Pool;
 use bb8_postgres::PostgresConnectionManager;
+use bytes::Bytes;
 use lazy_static::lazy_static;
 use moka::future::{Cache, CacheBuilder};
 use rss::{Channel, ChannelBuilder, Item};
@@ -15,6 +16,7 @@ use sentry::integrations::contexts::ContextIntegration;
 use sentry::integrations::tower::{NewSentryLayer, SentryHttpLayer};
 use sentry::integrations::tracing::EventFilter;
 use std::fmt::Display;
+use std::io::BufRead;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -225,7 +227,7 @@ async fn get_feed_by_url(url: Feed, rss_cache: Cache<Feed, Channel>) -> Option<C
         None => {
             let current_span = Span::current();
             current_span.record("cache.result", "miss");
-            if let Some(channel) = make_request(&url).await {
+            if let Some(channel) = get_external_feed(&url, rss_cache.clone()).await {
                 rss_cache.insert(url, channel.clone()).await;
                 Some(channel)
             } else {
@@ -236,33 +238,80 @@ async fn get_feed_by_url(url: Feed, rss_cache: Cache<Feed, Channel>) -> Option<C
 }
 
 #[instrument]
-async fn make_request(url: &Feed) -> Option<Channel> {
-    let content = match reqwest::get(&url.0).await {
-        Ok(response) => match response.status() {
-            StatusCode::OK => match response.bytes().await {
-                Ok(bytes) => bytes,
-                Err(err) => {
-                    error!(error = %err, "error reading response bytes");
-                    return None;
-                }
-            },
-            _ => {
-                if let Ok(text) = response.text().await {
-                    error!(url = %url, response = text, "response was not 200 OK");
-                } else {
-                    error!(url = %url, "response was not 200 OK, error reading response text");
-                }
-
-                return None;
-            }
-        },
+async fn get_external_feed(url: &Feed, rss_cache: Cache<Feed, Channel>) -> Option<Channel> {
+    let content = match make_http_request(url.0.clone()).await {
+        Ok(content) => content,
+        Err(HttpError::TooManyRequests) => {
+            tokio::spawn(retry(url.clone(), 3, rss_cache));
+            return None;
+        }
         Err(err) => {
-            error!(error = %err, url = %url, "error fetching url");
             return None;
         }
     };
 
-    Channel::read_from(&content[..]).map_or_else(
+    channel_from_content(&content[..], url)
+}
+
+async fn retry(url: Feed, retries: usize, rss_cache: Cache<Feed, Channel>) {
+    match make_http_request(url.0.clone()).await {
+        Ok(content) => {
+            if let Some(channel) = channel_from_content(&content[..], &url) {
+                rss_cache.insert(url, channel.clone()).await;
+            }
+        }
+        Err(_) => {
+            if retries > 0 {
+                let secs = rand::random_range(30..(15 * 10));
+                tokio::time::sleep(Duration::from_secs(secs)).await;
+                Box::pin(retry(url, retries - 1, rss_cache)).await;
+            }
+        }
+    }
+}
+
+fn make_http_request(url: String) -> impl Future<Output = Result<Bytes, HttpError>> + Send {
+    async move {
+        match reqwest::get(&url).await {
+            Ok(response) => match response.status() {
+                StatusCode::OK => match response.bytes().await {
+                    Ok(bytes) => Ok(bytes),
+                    Err(err) => {
+                        error!(error = %err, "error reading response bytes");
+                        Err(HttpError::ReadError("error reading response".to_string()))
+                    }
+                },
+                StatusCode::TOO_MANY_REQUESTS => {
+                    error!(url = %url, "too many requests");
+                    Err(HttpError::TooManyRequests)
+                }
+                _ => {
+                    if let Ok(text) = response.text().await {
+                        error!(url = %url, response = text, "response was not 200 OK");
+                    } else {
+                        error!(url = %url, "response was not 200 OK, error reading response text");
+                    }
+
+                    Err(HttpError::NotOk("response was not 200 OK".to_string()))
+                }
+            },
+            Err(err) => {
+                error!(error = %err, url = %url, "error fetching url");
+                Err(HttpError::ConnectionError("error fetching url".to_string()))
+            }
+        }
+    }
+}
+
+enum HttpError {
+    ConnectionError(String),
+    NotOk(String),
+    TooManyRequests,
+    ReadError(String),
+}
+
+fn channel_from_content(content: impl BufRead, url: &Feed) -> Option<Channel> {
+    Channel::read_from(content).map_or_else(
         |err| {
             error!(error = %err, url = %url, "Could not read channel from response");
             None
@@ -307,6 +356,13 @@ impl From<String> for Feed {
     fn from(s: String) -> Self {
         // TODO: add url parsing
         Self(s)
+    }
+}
+
+impl From<&String> for Feed {
+    fn from(s: &String) -> Self {
+        // TODO: add url parsing
+        Self(s.clone())
     }
 }
 
