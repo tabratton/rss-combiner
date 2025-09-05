@@ -19,11 +19,12 @@ use std::fmt::Display;
 use std::io::BufRead;
 use std::sync::Arc;
 use std::time::Duration;
+use sentry::Hub;
 use tokio::net::TcpListener;
 use tokio::task::JoinSet;
 use tower::ServiceBuilder;
 use tower_http::cors::CorsLayer;
-use tracing::{Instrument, Span, error, info, instrument};
+use tracing::{Instrument, error, info, instrument};
 use tracing_subscriber::fmt::format::FmtSpan;
 use tracing_subscriber::fmt::time::UtcTime;
 use tracing_subscriber::layer::SubscriberExt;
@@ -212,13 +213,17 @@ async fn get_feed_items(feeds: Arc<Vec<Feed>>, rss_cache: Cache<Feed, Channel>) 
 async fn get_feed_by_url(url: Feed, rss_cache: Cache<Feed, Channel>) -> Option<Channel> {
     match rss_cache.get(&url).await {
         Some(channel) => {
-            let current_span = Span::current();
-            current_span.record("cache.result", "hit");
+            let span = Hub::current().configure_scope(|scope| scope.get_span());
+            if let Some(span) = span {
+                span.set_data("cacheResult", "hit".into());
+            }
             Some(channel)
         }
         None => {
-            let current_span = Span::current();
-            current_span.record("cache.result", "miss");
+            let span = Hub::current().configure_scope(|scope| scope.get_span());
+            if let Some(span) = span {
+                span.set_data("cacheResult", "miss".into());
+            }
             if let Some(channel) = get_external_feed(&url, rss_cache.clone()).await {
                 rss_cache.insert(url, channel.clone()).await;
                 Some(channel)
@@ -229,7 +234,7 @@ async fn get_feed_by_url(url: Feed, rss_cache: Cache<Feed, Channel>) -> Option<C
     }
 }
 
-#[instrument]
+#[instrument(skip(rss_cache))]
 async fn get_external_feed(url: &Feed, rss_cache: Cache<Feed, Channel>) -> Option<Channel> {
     let content = match make_http_request(url.clone().into()).await {
         Ok(content) => content,
@@ -260,6 +265,7 @@ async fn retry(url: Feed, retries: usize, rss_cache: Cache<Feed, Channel>) {
     }
 }
 
+#[instrument]
 async fn make_http_request(url: String) -> Result<Bytes, HttpError> {
     match reqwest::get(&url).await {
         Ok(response) => match response.status() {
