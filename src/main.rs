@@ -202,8 +202,10 @@ async fn get_feed_items(feeds: Arc<Vec<Feed>>, rss_cache: Cache<Feed, Channel>) 
         join_set.spawn(get_feed_closure.in_current_span());
     }
 
-    while let Some(Ok(Some(channel))) = join_set.join_next().await {
-        feed_items.extend(channel.items.iter().take(*ITEMS_PER_FEED).cloned())
+    while let Some(task_result) = join_set.join_next().await {
+        if let Ok(Some(channel)) = task_result {
+            feed_items.extend(channel.items.iter().take(*ITEMS_PER_FEED).cloned());
+        }
     }
 
     feed_items
@@ -213,15 +215,13 @@ async fn get_feed_items(feeds: Arc<Vec<Feed>>, rss_cache: Cache<Feed, Channel>) 
 async fn get_feed_by_url(url: Feed, rss_cache: Cache<Feed, Channel>) -> Option<Channel> {
     match rss_cache.get(&url).await {
         Some(channel) => {
-            let span = Hub::current().configure_scope(|scope| scope.get_span());
-            if let Some(span) = span {
+            if let Some(span) = Hub::current().configure_scope(|scope| scope.get_span()) {
                 span.set_data("cacheResult", "hit".into());
             }
             Some(channel)
         }
         None => {
-            let span = Hub::current().configure_scope(|scope| scope.get_span());
-            if let Some(span) = span {
+            if let Some(span) = Hub::current().configure_scope(|scope| scope.get_span()) {
                 span.set_data("cacheResult", "miss".into());
             }
             if let Some(channel) = get_external_feed(&url, rss_cache.clone()).await {
