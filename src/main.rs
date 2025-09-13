@@ -10,6 +10,7 @@ use bytes::Bytes;
 use lazy_static::lazy_static;
 use moka::future::{Cache, CacheBuilder};
 use rss::{Channel, ChannelBuilder, Item};
+use sentry::Hub;
 use sentry::integrations::contexts::ContextIntegration;
 use sentry::integrations::tower::{NewSentryLayer, SentryHttpLayer};
 use sentry::integrations::tracing::EventFilter;
@@ -19,12 +20,11 @@ use std::fmt::Display;
 use std::io::BufRead;
 use std::sync::Arc;
 use std::time::Duration;
-use sentry::Hub;
 use tokio::net::TcpListener;
 use tokio::task::JoinSet;
 use tower::ServiceBuilder;
 use tower_http::cors::CorsLayer;
-use tracing::{Instrument, error, info, instrument};
+use tracing::{Instrument, error, info, info_span, instrument};
 use tracing_subscriber::fmt::format::FmtSpan;
 use tracing_subscriber::fmt::time::UtcTime;
 use tracing_subscriber::layer::SubscriberExt;
@@ -198,8 +198,10 @@ async fn get_feed_items(feeds: Arc<Vec<Feed>>, rss_cache: Cache<Feed, Channel>) 
     for feed in feeds.iter() {
         let cache = rss_cache.clone();
         let url = feed.clone();
-        let get_feed_closure = async move { get_feed_by_url(url, cache).await };
-        join_set.spawn(get_feed_closure.in_current_span());
+        join_set.spawn(
+            async move { get_feed_by_url(url, cache).await }
+                .instrument(info_span!("spawn_get_feed_task").or_current()),
+        );
     }
 
     while let Some(task_result) = join_set.join_next().await {
@@ -242,7 +244,7 @@ async fn get_external_feed(url: &Feed, rss_cache: Cache<Feed, Channel>) -> Optio
             tokio::spawn(retry(url.clone(), 3, rss_cache));
             return None;
         }
-        Err(_) => return None
+        Err(_) => return None,
     };
 
     channel_from_content(&content[..], url)
