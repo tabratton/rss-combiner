@@ -20,3 +20,6 @@ tower = "0.5.2"
 tower-http = { version = "0.6.6", features = ["cors"] }
 tracing = "0.1.41"
 tracing-subscriber = { version = "0.3.20", features = ["env-filter", "fmt", "time"] }
+
+[profile.release]
+lto = "thin"

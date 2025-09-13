@@ -241,7 +241,9 @@ async fn get_external_feed(url: &Feed, rss_cache: Cache<Feed, Channel>) -> Optio
     let content = match make_http_request(url.clone().into()).await {
         Ok(content) => content,
         Err(HttpError::TooManyRequests) => {
-            tokio::spawn(retry(url.clone(), 3, rss_cache));
+            tokio::spawn(
+                retry(url.clone(), 3, rss_cache).instrument(info_span!("retry_task").or_current()),
+            );
             return None;
         }
         Err(_) => return None,
