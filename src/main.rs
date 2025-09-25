@@ -217,15 +217,12 @@ async fn get_feed_items(feeds: Arc<Vec<Feed>>, rss_cache: Cache<Feed, Channel>) 
 async fn get_feed_by_url(url: Feed, rss_cache: Cache<Feed, Channel>) -> Option<Channel> {
     match rss_cache.get(&url).await {
         Some(channel) => {
-            if let Some(span) = Hub::current().configure_scope(|scope| scope.get_span()) {
-                span.set_data("cacheResult", "hit".into());
-            }
+            add_metric_data("cacheResult", "hit".into());
             Some(channel)
         }
         None => {
-            if let Some(span) = Hub::current().configure_scope(|scope| scope.get_span()) {
-                span.set_data("cacheResult", "miss".into());
-            }
+            add_metric_data("cacheResult", "miss".into());
+
             if let Some(channel) = get_external_feed(&url, rss_cache.clone()).await {
                 rss_cache.insert(url, channel.clone()).await;
                 Some(channel)
@@ -339,6 +336,12 @@ async fn flush_caches(State(app_state): State<AppState>) -> impl IntoResponse {
     rss_cache.invalidate_all();
 
     StatusCode::OK
+}
+
+fn add_metric_data(key: &str, value: sentry::protocol::Value) {
+    if let Some(span) = Hub::current().configure_scope(|scope| scope.get_span()) {
+        span.set_data(key, value);
+    }
 }
 
 #[derive(Clone, Eq, PartialEq, Debug, Hash)]
