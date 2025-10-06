@@ -206,7 +206,7 @@ async fn get_feed_items(feeds: Arc<Vec<Feed>>, rss_cache: Cache<Feed, Channel>) 
 
     while let Some(task_result) = join_set.join_next().await {
         if let Ok(Some(channel)) = task_result {
-            feed_items.extend(channel.items.iter().take(*ITEMS_PER_FEED).cloned());
+            feed_items.extend(channel.items);
         }
     }
 
@@ -223,7 +223,8 @@ async fn get_feed_by_url(url: Feed, rss_cache: Cache<Feed, Channel>) -> Option<C
         None => {
             add_metric_data("cacheResult", "miss".into());
 
-            if let Some(channel) = get_external_feed(&url, rss_cache.clone()).await {
+            if let Some(mut channel) = get_external_feed(&url, rss_cache.clone()).await {
+                channel.items.truncate(*ITEMS_PER_FEED);
                 rss_cache.insert(url, channel.clone()).await;
                 Some(channel)
             } else {
