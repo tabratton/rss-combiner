@@ -255,7 +255,8 @@ async fn retry(url: Feed, retries: usize, rss_cache: Cache<Feed, Channel>) {
     tokio::time::sleep(Duration::from_secs(secs)).await;
     match make_http_request(url.clone().into()).await {
         Ok(content) => {
-            if let Some(channel) = channel_from_content(&content[..], &url) {
+            if let Some(mut channel) = channel_from_content(&content[..], &url) {
+                channel.items.truncate(*ITEMS_PER_FEED);
                 rss_cache.insert(url, channel.clone()).await;
             }
         }
