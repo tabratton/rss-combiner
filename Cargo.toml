@@ -13,7 +13,7 @@ moka = { version = "0.12.11", features = ["default", "future"] }
 rand = "0.10.0-rc.0"
 reqwest = "0.12.23"
 rss = "2.0.12"
-sentry = { version = "0.43.0", features = ["anyhow", "default", "logs", "tracing", "tower", "tower-axum-matched-path", "tower-http"] }
+sentry = { version = "0.45.0", features = ["anyhow", "default", "logs", "tracing", "tower", "tower-axum-matched-path", "tower-http"] }
 sqlx = { version = "0.8.6", features = [ "chrono", "postgres", "runtime-tokio" ] }
 tokio = { version = "1.47.1", features = ["rt-multi-thread", "signal"] }
 tower = "0.5.2"
