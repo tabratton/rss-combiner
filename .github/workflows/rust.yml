@@ -13,10 +13,12 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
+      - run: rustup toolchain install nightly
+      - run: rustup component add rustc-codegen-cranelift-preview --toolchain nightly
       - uses: Swatinem/rust-cache@v2
       - uses: rui314/setup-mold@v1
       - name: Build (Rust)
-        run: cargo build
+        run: cargo build --verbose
       - name: Run tests
         run: cargo test

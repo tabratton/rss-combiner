@@ -3,14 +3,15 @@ FROM lukemathwalker/cargo-chef:latest-rust-1 AS chef
 FROM chef AS planner
 WORKDIR /plan
 COPY . .
-RUN cargo chef prepare --recipe-path recipe.json
+RUN rustup component add rustc-codegen-cranelift-preview --toolchain nightly
+RUN cargo +nightly chef prepare --recipe-path recipe.json
 
 FROM chef AS builder
 WORKDIR /work
 COPY --from=planner /plan/recipe.json recipe.json
 # Build dependencies - this is the caching Docker layer!
 RUN apt-get update && apt-get install -y mold
-RUN cargo chef cook --release --recipe-path recipe.json
+RUN cargo +nightly chef cook --release --recipe-path recipe.json
 COPY . .
 RUN cargo build --release
 
