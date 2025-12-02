@@ -19,7 +19,7 @@ sentry = { version = "0.46.0", features = ["anyhow", "default", "logs", "tracing
 sqlx = { version = "0.8.6", features = [ "chrono", "postgres", "runtime-tokio" ] }
 tokio = { version = "1.48.0", features = ["rt-multi-thread", "signal"] }
 tower = "0.5.2"
-tower-http = { version = "0.6.6", features = ["cors"] }
+tower-http = { version = "0.6.7", features = ["cors"] }
 tracing = "0.1.41"
 tracing-subscriber = { version = "0.3.20", features = ["env-filter", "fmt", "time"] }
 
