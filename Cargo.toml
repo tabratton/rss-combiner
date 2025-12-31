@@ -30,4 +30,4 @@ panic = "abort"
 
 [profile.dev]
 debug = 0
-codegen-backend = "cranelift"
+#codegen-backend = "cranelift"
