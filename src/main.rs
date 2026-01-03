@@ -99,15 +99,19 @@ async fn run_server() -> Result<(), anyhow::Error> {
         .connect(postgres_url.as_ref())
         .await?;
 
-    let cache_ttl: u64 = match std::env::var("CACHE_TTL_MINS") {
+    let rss_cache_ttl: u64 = match std::env::var("RSS_CACHE_TTL_MINS") {
         Ok(v) => v.parse()?,
         Err(_) => 35,
     };
+    let db_cache_ttl: u64 = match std::env::var("DB_CACHE_TTL_HOURS") {
+        Ok(v) => v.parse()?,
+        Err(_) => 168,
+    };
     let rss_cache = CacheBuilder::new(100)
-        .time_to_live(Duration::from_mins(cache_ttl))
+        .time_to_live(Duration::from_mins(rss_cache_ttl))
         .build();
     let feed_cache = CacheBuilder::new(1)
-        .time_to_live(Duration::from_days(7))
+        .time_to_live(Duration::from_days(db_cache_ttl))
         .build();
 
     let app_state = AppState {
