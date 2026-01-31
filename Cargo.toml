@@ -12,7 +12,7 @@ bytes = "1.11.0"
 lazy_static = "1.5.0"
 mockito = "1.7.1"
 moka = { version = "0.12.13", features = ["default", "future"] }
-rand = "0.10.0-rc.6"
+rand = "0.10.0-rc.8"
 reqwest = "0.12.28"
 rss = "2.0.12"
 sentry = { version = "0.46.1", features = ["anyhow", "default", "logs", "tracing", "tower", "tower-axum-matched-path", "tower-http"] }
