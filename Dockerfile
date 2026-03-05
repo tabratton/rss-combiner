@@ -15,7 +15,7 @@ RUN cargo +nightly chef cook --release --recipe-path recipe.json
 COPY . .
 RUN cargo build --release
 
-FROM debian:bookworm-slim AS runtime
+FROM debian:trixie-slim AS runtime
 WORKDIR /app
 COPY --from=builder /work/target/release/rss-combiner /usr/local/bin
 RUN apt-get update && apt-get install -y openssl ca-certificates
