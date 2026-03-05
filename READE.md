@@ -1,0 +1,1 @@
+[![codecov](https://codecov.io/github/tabratton/rss-combiner/graph/badge.svg?token=ZPXQ0ZYML5)](https://codecov.io/github/tabratton/rss-combiner)
