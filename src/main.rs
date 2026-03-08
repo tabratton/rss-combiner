@@ -404,6 +404,36 @@ mod test {
     use super::*;
 
     #[tokio::test]
+    async fn test_get_db_feeds() -> Result<(), anyhow::Error> {
+        let postgres_url = std::env::var("DATABASE_URL")?;
+        let db_pool = PgPoolOptions::new()
+            .max_connections(10)
+            .connect(postgres_url.as_ref())
+            .await?;
+        let cache = CacheBuilder::default().build();
+
+        // setup db
+        sqlx::query("INSERT INTO rss.feeds (id, url) VALUES ($1, $2)")
+            .bind(1)
+            .bind("https://test.com".to_string())
+            .execute(&db_pool)
+            .await?;
+        sqlx::query("INSERT INTO rss.feeds (id, url) VALUES ($1, $2)")
+            .bind(2)
+            .bind("https://test2.com".to_string())
+            .execute(&db_pool)
+            .await?;
+
+        let feeds = get_db_feeds(db_pool, cache).await.unwrap();
+
+        assert_eq!(2, feeds.len());
+        assert!(feeds.iter().any(|feed| feed.url == "https://test.com"));
+        assert!(feeds.iter().any(|feed| feed.url == "https://test2.com"));
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn test_get_feed_by_url() {
         let cache = CacheBuilder::default().build();
         let mut server = mockito::Server::new_async().await;
