@@ -11,7 +11,7 @@ axum = { version = "0.8.8", features = ["default", "http2", "macros"] }
 bytes = "1.11.1"
 lazy_static = "1.5.0"
 mockito = "1.7.2"
-moka = { version = "0.12.13", features = ["default", "future"] }
+moka = { version = "0.12.14", features = ["default", "future"] }
 rand = "0.10.0"
 reqwest = "0.13.2"
 rss = "2.0.12"
