@@ -45,7 +45,7 @@ jobs:
         env:
           DATABASE_URL: postgres://postgres:postgres@localhost/postgres
       - name: Upload coverage to Codecov
-        uses: codecov/codecov-action@v5
+        uses: codecov/codecov-action@v6
         with:
           token: ${{ secrets.CODECOV_TOKEN }} # required for private repos or protected branches
           files: codecov.json
