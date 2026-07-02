@@ -79,17 +79,13 @@ fn main() -> Result<(), anyhow::Error> {
     let integration = ContextIntegration::new().add_os(false);
     let _guard = sentry::init((
         std::env::var("SENTRY_DSN")?,
-        sentry::ClientOptions {
-            release: sentry::release_name!(),
-            // Capture user IPs and potentially sensitive headers when using HTTP server integrations
-            // see https://docs.sentry.io/platforms/rust/data-management/data-collected for more info
-            send_default_pii: true,
-            enable_logs: true,
-            sample_rate: 0.1,
-            traces_sample_rate: 1.0,
-            ..Default::default()
-        }
-        .add_integration(integration),
+        sentry::ClientOptions::new()
+            .release(sentry::release_name!().unwrap())
+            .send_default_pii(true)
+            .enable_logs(true)
+            .sample_rate(0.1)
+            .traces_sample_rate(1.0)
+            .add_integration(integration),
     ));
 
     setup_logging();
