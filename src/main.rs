@@ -1,11 +1,18 @@
 #![feature(duration_constructors)]
 
+mod api;
+mod db;
+
+use crate::api::{
+    create_feed_item, delete_feed_item, flush_caches, generate_feed, list_feed_items,
+    update_feed_item,
+};
+use crate::db::get_db_feeds_hard_read;
 use axum::Router;
 use axum::body::Body;
-use axum::extract::State;
-use axum::http::{Request, StatusCode, header};
+use axum::http::{Request, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::routing::get;
+use axum::routing::{get, put};
 use bytes::Bytes;
 use lazy_static::lazy_static;
 use moka::future::{Cache, CacheBuilder};
@@ -14,6 +21,7 @@ use sentry::Hub;
 use sentry::integrations::contexts::ContextIntegration;
 use sentry::integrations::tower::{NewSentryLayer, SentryHttpLayer};
 use sentry::integrations::tracing::EventFilter;
+use serde::{Deserialize, Serialize};
 use sqlx::postgres::PgPoolOptions;
 use sqlx::{Pool, Postgres};
 use std::fmt::Display;
@@ -120,6 +128,10 @@ async fn run_server() -> Result<(), anyhow::Error> {
         feed_cache,
     };
 
+    if populate_caches(app_state.clone()).await.is_err() {
+        error!("Failed to populate caches");
+    }
+
     let layer = ServiceBuilder::new()
         .layer(NewSentryLayer::<Request<Body>>::new_from_top())
         .layer(SentryHttpLayer::new().enable_transaction().enable_pii())
@@ -127,6 +139,11 @@ async fn run_server() -> Result<(), anyhow::Error> {
 
     let app: Router<()> = Router::new()
         .route("/rss", get(generate_feed))
+        .route("/feeds", get(list_feed_items).post(create_feed_item))
+        .route(
+            "/feeds/{id}",
+            put(update_feed_item).delete(delete_feed_item),
+        )
         .route("/flush", get(flush_caches))
         .with_state(app_state)
         .layer(layer);
@@ -146,53 +163,32 @@ async fn run_server() -> Result<(), anyhow::Error> {
 }
 
 #[derive(Clone)]
-struct AppState {
+pub struct AppState {
     db_pool: Pool<Postgres>,
     feed_cache: Cache<usize, Arc<Vec<Feed>>>,
     rss_cache: Cache<Feed, Channel>,
 }
 
 #[instrument(skip(app_state))]
-async fn generate_feed(State(app_state): State<AppState>) -> Result<impl IntoResponse, AppError> {
+pub async fn populate_caches(app_state: AppState) -> Result<(), AppError> {
     let db_pool = app_state.db_pool.clone();
     let rss_cache = app_state.rss_cache.clone();
     let feed_cache = app_state.feed_cache.clone();
 
-    let feeds = match get_db_feeds(db_pool, feed_cache).await {
-        Ok(feeds) => feeds,
-        Err(err) => {
-            error!(error = %err.0, "Error while getting list of feeds from database");
-            return Err(err);
-        }
-    };
+    let feeds = Arc::new(get_db_feeds_hard_read(db_pool).await?);
+    feed_cache.insert(0, feeds.clone()).await;
 
-    let feed_items = get_feed_items(feeds, rss_cache).await;
-
-    Ok((
-        [(header::CONTENT_TYPE, "text/xml")],
-        get_return_string(feed_items),
-    ))
-}
-
-#[instrument(skip(db_pool, feed_cache))]
-async fn get_db_feeds(
-    db_pool: Pool<Postgres>,
-    feed_cache: Cache<usize, Arc<Vec<Feed>>>,
-) -> Result<Arc<Vec<Feed>>, AppError> {
-    match feed_cache.get(&0).await {
-        Some(feeds) => Ok(feeds),
-        None => {
-            let feeds: Arc<Vec<Feed>> = Arc::new(
-                sqlx::query_as!(Feed, "SELECT url FROM rss.feeds ORDER BY id")
-                    .fetch_all(&db_pool)
-                    .await?,
-            );
-
-            feed_cache.insert(0, feeds.clone()).await;
-
-            Ok(feeds)
-        }
+    for feed in feeds.iter() {
+        let cache = rss_cache.clone();
+        let url = feed.clone();
+        tokio::spawn(
+            async move { populate_feed_cache(url, cache).await }
+                .instrument(info_span!("spawn_populate_feed_task").or_current()),
+        );
+        tokio::time::sleep(Duration::from_secs(rand::random_range(1..=5))).await;
     }
+
+    Ok(())
 }
 
 #[instrument(skip(feeds, rss_cache))]
@@ -226,15 +222,19 @@ async fn get_feed_by_url(url: Feed, rss_cache: Cache<Feed, Channel>) -> Option<C
         }
         None => {
             add_metric_data("cacheResult", "miss".into());
-
-            if let Some(mut channel) = get_external_feed(&url, rss_cache.clone()).await {
-                channel.items.truncate(*ITEMS_PER_FEED);
-                rss_cache.insert(url, channel.clone()).await;
-                Some(channel)
-            } else {
-                None
-            }
+            populate_feed_cache(url, rss_cache).await
         }
+    }
+}
+
+#[instrument(skip(rss_cache))]
+async fn populate_feed_cache(url: Feed, rss_cache: Cache<Feed, Channel>) -> Option<Channel> {
+    if let Some(mut channel) = get_external_feed(&url, rss_cache.clone()).await {
+        channel.items.truncate(*ITEMS_PER_FEED);
+        rss_cache.insert(url, channel.clone()).await;
+        Some(channel)
+    } else {
+        None
     }
 }
 
@@ -333,26 +333,27 @@ fn get_return_string(feed_items: Vec<Item>) -> String {
     return_feed.to_string()
 }
 
-#[instrument(skip(app_state))]
-async fn flush_caches(State(app_state): State<AppState>) -> impl IntoResponse {
-    let rss_cache = app_state.rss_cache.clone();
-    let feed_cache = app_state.feed_cache.clone();
-
-    feed_cache.invalidate_all();
-    rss_cache.invalidate_all();
-
-    StatusCode::OK
-}
-
 fn add_metric_data(key: &str, value: sentry::protocol::Value) {
     if let Some(span) = Hub::current().configure_scope(|scope| scope.get_span()) {
         span.set_data(key, value);
     }
 }
 
-#[derive(Clone, Eq, PartialEq, Debug, Hash)]
+#[derive(Clone, Eq, PartialEq, Debug, Hash, Serialize, Deserialize)]
 struct Feed {
     url: String,
+}
+
+#[derive(Clone, Eq, PartialEq, Debug, Hash, Serialize, Deserialize)]
+struct FullFeed {
+    id: i64,
+    url: String,
+}
+
+impl From<FullFeed> for Feed {
+    fn from(item: FullFeed) -> Self {
+        Self { url: item.url }
+    }
 }
 
 impl From<String> for Feed {
@@ -402,36 +403,6 @@ where
 #[cfg(test)]
 mod test {
     use super::*;
-
-    #[tokio::test]
-    async fn test_get_db_feeds() -> Result<(), anyhow::Error> {
-        let postgres_url = std::env::var("DATABASE_URL")?;
-        let db_pool = PgPoolOptions::new()
-            .max_connections(10)
-            .connect(postgres_url.as_ref())
-            .await?;
-        let cache = CacheBuilder::default().build();
-
-        // setup db
-        sqlx::query("INSERT INTO rss.feeds (id, url) VALUES ($1, $2)")
-            .bind(1)
-            .bind("https://test.com".to_string())
-            .execute(&db_pool)
-            .await?;
-        sqlx::query("INSERT INTO rss.feeds (id, url) VALUES ($1, $2)")
-            .bind(2)
-            .bind("https://test2.com".to_string())
-            .execute(&db_pool)
-            .await?;
-
-        let feeds = get_db_feeds(db_pool, cache).await.unwrap();
-
-        assert_eq!(2, feeds.len());
-        assert!(feeds.iter().any(|feed| feed.url == "https://test.com"));
-        assert!(feeds.iter().any(|feed| feed.url == "https://test2.com"));
-
-        Ok(())
-    }
 
     #[tokio::test]
     async fn test_get_feed_by_url() {
