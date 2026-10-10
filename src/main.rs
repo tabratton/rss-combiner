@@ -468,7 +468,7 @@ mod test {
             .expect(1)
             .create();
 
-        let feeds = vec![format!("{url}/rss1").into(), format!("{url}/rss2").into()];
+        let feeds = [format!("{url}/rss1").into(), format!("{url}/rss2").into()];
         let items = get_feed_items(Arc::new(feeds.to_vec()), cache.clone()).await;
         assert_eq!(2, items.len());
         mock1.assert_async().await;
