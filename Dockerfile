@@ -10,7 +10,7 @@ FROM chef AS builder
 WORKDIR /work
 COPY --from=planner /plan/recipe.json recipe.json
 # Build dependencies - this is the caching Docker layer!
-RUN apt-get update && apt-get install -y mold
+# RUN apt-get update && apt-get install -y mold
 RUN cargo +nightly chef cook --release --recipe-path recipe.json
 COPY . .
 RUN cargo build --release

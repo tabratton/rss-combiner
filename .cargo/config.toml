@@ -1,8 +1,9 @@
-[target.'cfg(target_os = "linux")']
-rustflags = ["-C", "link-arg=-fuse-ld=mold"]
+#[target.'cfg(target_os = "linux")']
+#rustflags = ["-C", "link-arg=-fuse-ld=mold"]
 
 [profile.release]
-rustflags = ["-Zthreads=8", "-Ctarget-cpu=native"]
+#rustflags = ["-Zthreads=8", "-Ctarget-cpu=native"]
+rustflags = ["-Zthreads=8"]
 
 [profile.dev]
 rustflags = ["-Zthreads=8"]
